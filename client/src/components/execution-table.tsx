@@ -76,7 +76,8 @@ const OpenCellRenderer = (params: ICellRendererParams<ExecutionLog>) => {
     return <span className="text-muted-foreground">-</span>;
   }
   
-  const url = `http://localhost:5678/workflow/${data.workflow_id}/executions/${data.execution_id}`;
+  const baseUrl = import.meta.env.VITE_N8N_URL || 'https://n8n.ias-nexus-automacao.com.br';
+  const url = `${baseUrl}/workflow/${data.workflow_id}/executions/${data.execution_id}`;
   
   return (
     <Button
