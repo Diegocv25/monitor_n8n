@@ -4,40 +4,176 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json());
 
-const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!
-);
+// Initialize Supabase client inside a getter to prevent crashes on startup if env is missing
+function getSupabase() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    throw new Error("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing");
+  }
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+}
 
+// Get all executions
 app.get("/api/executions", async (req, res) => {
-    const { data, error } = await supabase
-        .from("n8n_execution_logs")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(100);
+  try {
+    const client = getSupabase();
+    const limit = parseInt(req.query.limit as string) || 100;
+    
+    const { data, error } = await client
+      .from("n8n_execution_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
     if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
+    res.json(data || []);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
+// Get execution statistics
 app.get("/api/executions/stats", async (req, res) => {
-    const { data, error } = await supabase
-        .from("n8n_execution_logs")
-        .select("status, duration_ms");
+  try {
+    const client = getSupabase();
+    const { data, error } = await client
+      .from("n8n_execution_logs")
+      .select("status, duration_ms");
+
     if (error) return res.status(500).json({ error: error.message });
-    const total = data.length;
-    const successful = data.filter(e => e.status === "success").length;
-    const failed = data.filter(e => e.status === "error").length;
-    const avgDuration = total > 0 ? data.reduce((a, b) => a + (b.duration_ms || 0), 0) / total : 0;
-    res.json({ total, successful, failed, avgDuration });
+
+    const executions = data || [];
+    const totalExecutions = executions.length;
+    const successCount = executions.filter(e => e.status === "success").length;
+    const errorCount = executions.filter(e => e.status === "error").length;
+    const runningCount = executions.filter(e => e.status === "running").length;
+    const waitingCount = executions.filter(e => e.status === "waiting").length;
+    const canceledCount = executions.filter(e => e.status === "canceled").length;
+    
+    const durationsWithValues = executions
+      .filter(e => e.duration_ms !== null)
+      .map(e => e.duration_ms as number);
+    
+    const avgDurationMs = durationsWithValues.length > 0
+      ? Math.round(durationsWithValues.reduce((a, b) => a + b, 0) / durationsWithValues.length)
+      : 0;
+
+    const successRate = totalExecutions > 0 
+      ? (successCount / totalExecutions) * 100 
+      : 0;
+
+    res.json({
+      totalExecutions,
+      successCount,
+      errorCount,
+      runningCount,
+      waitingCount,
+      canceledCount,
+      avgDurationMs,
+      successRate,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
+// Get daily execution statistics for chart
 app.get("/api/executions/daily", async (req, res) => {
-    const { data, error } = await supabase
-        .from("n8n_execution_logs")
-        .select("status, started_at")
-        .order("started_at", { ascending: true });
+  try {
+    const client = getSupabase();
+    const days = parseInt(req.query.days as string) || 14;
+    
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+    
+    const { data, error } = await client
+      .from("n8n_execution_logs")
+      .select("created_at, status")
+      .gte("created_at", startDate.toISOString())
+      .order("created_at", { ascending: true });
+
     if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
+
+    const dailyMap = new Map<string, { total: number; success: number; error: number }>();
+    
+    for (let i = 0; i <= days; i++) {
+      const date = new Date();
+      date.setDate(date.getDate() - (days - i));
+      const dateStr = date.toISOString().split("T")[0];
+      dailyMap.set(dateStr, { total: 0, success: 0, error: 0 });
+    }
+
+    (data || []).forEach(execution => {
+      const dateStr = new Date(execution.created_at).toISOString().split("T")[0];
+      const existing = dailyMap.get(dateStr) || { total: 0, success: 0, error: 0 };
+      existing.total++;
+      if (execution.status === "success") existing.success++;
+      else if (execution.status === "error") existing.error++;
+      dailyMap.set(dateStr, existing);
+    });
+
+    const dailyStats = Array.from(dailyMap.entries()).map(([date, stats]) => ({
+      date: new Date(date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      total: stats.total,
+      success: stats.success,
+      error: stats.error,
+    }));
+
+    res.json(dailyStats);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get workflow statistics
+app.get("/api/executions/workflows", async (req, res) => {
+  try {
+    const client = getSupabase();
+    const { data, error } = await client
+      .from("n8n_execution_logs")
+      .select("workflow_name, status, duration_ms");
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    const workflowMap = new Map<string, {
+      total_executions: number;
+      successful: number;
+      failed: number;
+      durations: number[];
+    }>();
+
+    (data || []).forEach(execution => {
+      const name = execution.workflow_name;
+      const existing = workflowMap.get(name) || {
+        total_executions: 0,
+        successful: 0,
+        failed: 0,
+        durations: [],
+      };
+      
+      existing.total_executions++;
+      if (execution.status === "success") existing.successful++;
+      if (execution.status === "error") existing.failed++;
+      if (execution.duration_ms !== null) {
+        existing.durations.push(execution.duration_ms);
+      }
+      
+      workflowMap.set(name, existing);
+    });
+
+    const workflowStats = Array.from(workflowMap.entries()).map(([name, stats]) => ({
+      workflow_name: name,
+      total_executions: stats.total_executions,
+      successful: stats.successful,
+      failed: stats.failed,
+      avg_duration_ms: stats.durations.length > 0
+        ? Math.round(stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length)
+        : 0,
+    }));
+
+    res.json(workflowStats);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default app;
